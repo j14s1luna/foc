@@ -13535,6 +13535,36 @@ window.OG = (function() {
     sessionExportedLPOs.add(currentLPO);
     if (typeof audit === 'function') audit('og_sap_exported', `${currentLPO} · ${currentRows.length} lines · ${isFocOrder ? 'FOC' : 'Standard'}`);
 
+    // Record the generated order lines into state.orders so they appear in
+    // Order History AND auto-sync to the shared cloud database. Each export
+    // is one "file for upload" — tagged with the LPO as the batch reference.
+    try {
+      if (typeof state !== 'undefined' && Array.isArray(state.orders)) {
+        const nowIso = new Date().toISOString();
+        const batchRef = currentLPO || ('LPO_' + Date.now());
+        currentRows.forEach(r => {
+          if (!r.cpcCode) return;   // skip lines with no CPC code
+          state.orders.push({
+            id: 'og_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+            date: nowIso.slice(0, 10),
+            customer: currentShip || '',
+            soNumber: currentLPO || '',
+            itemCode: r.cpcCode,
+            itemName: r.cpcName || '',
+            qty: Number(r.cpcQty) || 0,
+            status: 'released',
+            flagged: r.status === 'oos' || r.status === 'hold',
+            salesman: '',
+            batchRef: batchRef,
+          });
+        });
+        if (typeof saveState === 'function') saveState();   // saveState() triggers cloud auto-sync
+        console.log('[OrderGen] Recorded', currentRows.filter(r => r.cpcCode).length, 'line(s) into Order History + cloud');
+      }
+    } catch (e) {
+      console.error('[OrderGen] Failed to record order to history:', e);
+    }
+
     // Run deduction if requested
     if (deductChoice === 'reserved' || deductChoice === 'released') {
       const eligible = currentRows.filter(r => Array.isArray(r._focVsEntries) && r._focVsEntries.length > 0);
