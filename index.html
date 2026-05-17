@@ -3008,6 +3008,7 @@
           <button class="btn" onclick="downloadVstockTemplate()">📥 Template</button>
           <button class="btn" onclick="document.getElementById('vstockFileInput').click()">📂 Load Stock</button>
           <button class="btn" onclick="exportVstockExcel()" id="vstockExportBtn">📊 Export</button>
+          <button class="btn" onclick="vsForceSyncNow()" id="vstockForceSyncBtn" title="Upload ALL Virtual Stock in this browser to the shared database — use this once if you pushed stock before cloud sync was set up">☁️ Sync to Database</button>
           <button class="btn btn-primary" onclick="openVstockEntryModal()">➕ Add Entry</button>
           <input type="file" id="vstockFileInput" class="file-hidden" accept=".xlsx,.xls,.csv" onchange="loadVirtualStockExcel(event)" />
         </div>
@@ -20314,18 +20315,21 @@ function updateAlertsBadge() {
 
   // Push local Virtual Stock changes to Supabase. Call this AFTER any
   // push / release / edit that touches state.virtualStock.
-  window.vsSyncToCloud = async function () {
+  window.vsSyncToCloud = async function (force) {
     if (!window.SB) { console.warn('[VStock Sync] Supabase not ready'); return; }
     const list = (window.state && window.state.virtualStock) || [];
 
-    // Find rows that are new or changed since last sync
+    // Find rows that are new or changed since last sync.
+    // When force=true, EVERY row is treated as changed — used by the
+    // "Force Sync to Database" button to push rows that were created
+    // before cloud sync existed.
     const changed = [];
     const currentIds = new Set();
     list.forEach(v => {
       const id = String(v.id);
       currentIds.add(id);
       const fp = _vsFingerprint(v);
-      if (_vsFingerprints[id] !== fp) {
+      if (force || _vsFingerprints[id] !== fp) {
         changed.push(_vsToRow(v));
         _vsFingerprints[id] = fp;
       }
@@ -20364,6 +20368,23 @@ function updateAlertsBadge() {
     }
   };
 
+  // Force-upload ALL local Virtual Stock to Supabase. Used by the
+  // "Sync to Database" button — fixes batches pushed before cloud sync.
+  window.vsForceSyncNow = async function () {
+    if (!window.SB) {
+      if (typeof showToast === 'function') showToast('Database not ready', 'error');
+      return;
+    }
+    const n = (window.state && window.state.virtualStock || []).length;
+    if (!n) {
+      if (typeof showToast === 'function') showToast('No Virtual Stock to sync', 'error');
+      return;
+    }
+    if (!confirm(`Upload all ${n} Virtual Stock batch(es) in this browser to the shared database?`)) return;
+    if (typeof showToast === 'function') showToast('Syncing Virtual Stock to database…', 'success');
+    await window.vsSyncToCloud(true);   // force = upload everything
+  };
+
   // Load shared Virtual Stock from Supabase into state.virtualStock.
   window.vsLoadFromCloud = async function () {
     if (!window.SB) { console.warn('[VStock Sync] Supabase not ready'); return 0; }
@@ -20397,6 +20418,20 @@ function updateAlertsBadge() {
         notes:        r.notes || '',
         lastUpdated:  r.last_updated || '',
       }));
+      const localCount = (window.state && window.state.virtualStock || []).length;
+
+      if (mapped.length === 0 && localCount > 0) {
+        // The cloud is empty but this browser still has local Virtual Stock.
+        // This happens when batches were pushed BEFORE cloud sync existed.
+        // Do NOT overwrite the local data with an empty list — instead,
+        // keep the local rows and mark them as "not yet synced" so the
+        // next sync (or the Force Sync button) uploads them.
+        _vsFingerprints = {};   // empty => every local row counts as "changed"
+        console.warn('[VStock Sync] Cloud empty but ' + localCount +
+          ' local batch(es) found — keeping local data. Use "Force Sync to Database" to upload them.');
+        return 0;
+      }
+
       if (window.state) window.state.virtualStock = mapped;
       // Reset fingerprints to the just-loaded state (so first sync only writes real changes)
       _vsFingerprints = {};
