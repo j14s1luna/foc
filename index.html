@@ -4513,6 +4513,11 @@ function saveState() {
     try { localStorage.removeItem(STORAGE_KEY + '_sales'); } catch (_) {}
     try { localStorage.removeItem(STORAGE_KEY + '_sales_lz'); } catch (_) {}
   }
+
+  // Auto-sync to the shared cloud database (debounced + background).
+  // Every change to orders / virtual stock / alerts is mirrored to
+  // Supabase so all users see it — without the user pressing a button.
+  if (typeof window.autoSyncAll === 'function') window.autoSyncAll();
 }
 
 function loadState() {
@@ -20312,6 +20317,8 @@ function updateAlertsBadge() {
   // and batches deleted locally are deleted remotely. If nothing
   // changed, ZERO write requests are made — quota friendly.
   let _vsFingerprints = {};   // { id: "qty|reserved|released|..." }
+  let _orderFingerprints = {};  // { id: "qty|status|flagged|..." }
+  let _alertFingerprints = {};  // { id: "status|title|message|..." }
 
   function _vsFingerprint(v) {
     return [
@@ -20551,6 +20558,9 @@ function updateAlertsBadge() {
         batchRef: r.batch_ref || '',
       }));
       if (window.state) window.state.orders = mapped;
+      // Record fingerprints so the next auto-sync only writes real changes.
+      _orderFingerprints = {};
+      mapped.forEach(o => { _orderFingerprints[String(o.id)] = _orderFp(o); });
       console.log('[Orders Sync] Loaded', mapped.length, 'order(s) from Supabase');
       if (typeof saveState === 'function') saveState();
       try { if (typeof renderAll === 'function') renderAll(); } catch (e) {}
@@ -20605,7 +20615,167 @@ function updateAlertsBadge() {
     }
   };
 
-  // Load both on startup, once Supabase is ready.
+  // ─────────────────────────────────────────────────────────────
+  //  ALERTS  —  sync to Supabase so every user sees CAP / removals
+  // ─────────────────────────────────────────────────────────────
+  function _alertFp(a) {
+    return [a.status, a.title, a.message, a.capped, a.removed].join('|');
+  }
+  function _alertToRow(a) {
+    return {
+      id:            String(a.id),
+      alert_ts:      a.ts || '',
+      type:          a.type || null,
+      severity:      a.severity || null,
+      status:        a.status || null,
+      title:         a.title || null,
+      message:       a.message || null,
+      material_code: a.materialCode || null,
+      requested:     (a.requested != null) ? Number(a.requested) : null,
+      available:     (a.available != null) ? Number(a.available) : null,
+      capped:        (a.capped != null) ? Number(a.capped) : null,
+      removed:       (a.removed != null) ? Number(a.removed) : null,
+      lpos:          a.lpos ? JSON.stringify(a.lpos) : null,
+      app_user:      a.user || appUser(),
+      raw:           JSON.stringify(a),
+    };
+  }
+
+  window.alertsSyncToCloud = async function (force) {
+    if (!window.SB) return;
+    const list = (window.state && window.state.alerts) || [];
+    const changed = [];
+    const currentIds = new Set();
+    list.forEach(a => {
+      const id = String(a.id);
+      currentIds.add(id);
+      const fp = _alertFp(a);
+      if (force || _alertFingerprints[id] !== fp) {
+        changed.push(_alertToRow(a));
+        _alertFingerprints[id] = fp;
+      }
+    });
+    const deletedIds = Object.keys(_alertFingerprints).filter(id => !currentIds.has(id));
+    try {
+      if (changed.length) {
+        for (let i = 0; i < changed.length; i += 500) {
+          const { error } = await window.SB
+            .from('alerts').upsert(changed.slice(i, i + 500), { onConflict: 'id' });
+          if (error) throw error;
+        }
+      }
+      if (deletedIds.length) {
+        const { error } = await window.SB.from('alerts').delete().in('id', deletedIds);
+        if (error) throw error;
+        deletedIds.forEach(id => delete _alertFingerprints[id]);
+      }
+      if (changed.length || deletedIds.length)
+        console.log(`[Alerts Sync] ${changed.length} updated, ${deletedIds.length} removed`);
+    } catch (err) {
+      console.error('[Alerts Sync] Failed:', err);
+    }
+  };
+
+  window.alertsLoadFromCloud = async function () {
+    if (!window.SB) return 0;
+    try {
+      const all = [];
+      let from = 0;
+      while (true) {
+        const { data, error } = await window.SB
+          .from('alerts').select('raw')
+          .order('created_at', { ascending: true })
+          .range(from, from + 999);
+        if (error) throw error;
+        if (!data || !data.length) break;
+        data.forEach(r => {
+          try { all.push(JSON.parse(r.raw)); } catch (e) {}
+        });
+        if (data.length < 1000) break;
+        from += 1000;
+      }
+      if (window.state) window.state.alerts = all;
+      _alertFingerprints = {};
+      all.forEach(a => { _alertFingerprints[String(a.id)] = _alertFp(a); });
+      console.log('[Alerts Sync] Loaded', all.length, 'alert(s) from Supabase');
+      if (typeof saveState === 'function') saveState();
+      try { if (typeof renderAll === 'function') renderAll(); } catch (e) {}
+      return all.length;
+    } catch (err) {
+      console.error('[Alerts Sync] Load failed:', err);
+      return 0;
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────
+  //  AUTO-SYNC  —  pushes Virtual Stock + Orders + Alerts together,
+  //  debounced and in the background so the UI never hangs.
+  // ─────────────────────────────────────────────────────────────
+  // Orders auto-sync: like vsSync, only changed rows are written.
+  function _orderFp(o) {
+    return [o.qty, o.status, o.flagged, o.customer, o.itemCode, o.soNumber].join('|');
+  }
+  window.ordersAutoSync = async function (force) {
+    if (!window.SB) return;
+    const list = (window.state && window.state.orders) || [];
+    const changed = [];
+    const currentIds = new Set();
+    list.forEach(o => {
+      const id = String(o.id);
+      currentIds.add(id);
+      const fp = _orderFp(o);
+      if (force || _orderFingerprints[id] !== fp) {
+        changed.push({
+          id: String(o.id), order_date: o.date || null, customer: o.customer || null,
+          so_number: o.soNumber || null, item_code: o.itemCode || null,
+          item_name: o.itemName || null, qty: Number(o.qty) || 0,
+          status: o.status || 'released', flagged: !!o.flagged,
+          salesman: o.salesman || null, batch_ref: o.batchRef || null,
+          saved_by: appUser(),
+        });
+        _orderFingerprints[id] = fp;
+      }
+    });
+    const deletedIds = Object.keys(_orderFingerprints).filter(id => !currentIds.has(id));
+    try {
+      if (changed.length) {
+        for (let i = 0; i < changed.length; i += 500) {
+          const { error } = await window.SB
+            .from('orders').upsert(changed.slice(i, i + 500), { onConflict: 'id' });
+          if (error) throw error;
+        }
+      }
+      if (deletedIds.length) {
+        const { error } = await window.SB.from('orders').delete().in('id', deletedIds);
+        if (error) throw error;
+        deletedIds.forEach(id => delete _orderFingerprints[id]);
+      }
+      if (changed.length || deletedIds.length)
+        console.log(`[Orders Sync] ${changed.length} updated, ${deletedIds.length} removed`);
+    } catch (err) {
+      console.error('[Orders Sync] Auto-sync failed:', err);
+    }
+  };
+
+  // Debounced unified auto-sync. Called by saveState(); waits 1.5s after
+  // the last change, then syncs everything in the background. Multiple
+  // rapid changes (e.g. capping 20 lines) collapse into ONE sync.
+  let _autoSyncTimer = null;
+  window.autoSyncAll = function () {
+    if (!window.SB) return;
+    clearTimeout(_autoSyncTimer);
+    _autoSyncTimer = setTimeout(() => {
+      // Run all three in the background — UI is not blocked.
+      Promise.resolve()
+        .then(() => window.vsSyncToCloud && window.vsSyncToCloud())
+        .then(() => window.ordersAutoSync && window.ordersAutoSync())
+        .then(() => window.alertsSyncToCloud && window.alertsSyncToCloud())
+        .catch(err => console.error('[Auto-Sync] Error:', err));
+    }, 1500);
+  };
+
+  // Sync everything together on startup load.
+  const _origSharedLoad = window.sharedSyncLoadAll;
   window.sharedSyncLoadAll = function () {
     if (!window.SB) {
       let tries = 0;
@@ -20617,9 +20787,10 @@ function updateAlertsBadge() {
     }
     window.vsLoadFromCloud();
     window.ordersLoadFromCloud();
+    window.alertsLoadFromCloud();
   };
 
-  console.log('[Shared Sync] Module loaded — Virtual Stock + Orders sync ready');
+  console.log('[Shared Sync] Module loaded — Virtual Stock + Orders + Alerts auto-sync ready');
 })();
 </script>
 
