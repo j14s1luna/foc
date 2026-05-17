@@ -4445,6 +4445,10 @@ let state = {
   vstockPriceFilter: 'all',   // Phase 4.15: 'all' | 'missing' | 'priced' — filter VS by pricing status
 };
 
+// Expose the live state object on window so the cloud-sync module
+// (which runs in a separate code block) can read it reliably.
+window.state = state;
+
 // =================================================================
 // Storage — uses browser localStorage so data survives closing the file/browser/laptop reboot.
 // Falls back to window.storage (sandboxed environments) if localStorage isn't available.
@@ -10701,6 +10705,8 @@ function doResetOrders() {
   saveState(); renderAll();
   closeResetChoice();
   broadcastReset('orders');
+  // Also clear the shared orders in the cloud so the reset is permanent.
+  if (typeof window.cloudResetOrders === 'function') window.cloudResetOrders();
   showToast(`${orderCount} order${orderCount === 1 ? '' : 's'} cleared`, 'success');
 }
 
@@ -10714,6 +10720,8 @@ function doResetVstock() {
   saveState(); renderAll();
   closeResetChoice();
   broadcastReset('vstock');
+  // Also clear the shared Virtual Stock in the cloud so the reset is permanent.
+  if (typeof window.cloudResetVstock === 'function') window.cloudResetVstock();
   showToast(`Virtual Stock cleared (${vsCount} lines, ${movCount} movements)`, 'success');
 }
 
@@ -10744,10 +10752,22 @@ function doResetEverything() {
     entryMode: 'single', bulkLines: [], bulkSubMode: 'paste', excelImportRows: [], bulkSO: '', bulkSalesman: '',
     bulkDate: new Date().toISOString().slice(0, 10),
   };
+  window.state = state;   // keep window.state pointing at the live object
   audit('full_reset', `Wiped ${masterCount} entitlements, ${orderCount} orders, ${vsCount} VS lines (audit log preserved, KPIs reset) — by ${AUTH.username || 'unknown'}`);
   saveState(); renderAll();
   closeResetChoice();
   broadcastReset('all');
+  // Also clear the shared cloud data so the reset is permanent and does
+  // not "come back" on the next refresh. Ask whether Sales + FOC Master
+  // (the big reference tables) should be wiped too.
+  if (typeof window.cloudResetEverything === 'function') {
+    const alsoWipeRef = confirm(
+      'Reset the SHARED CLOUD database too?\n\n' +
+      'OK   = also delete SAP Sales and FOC Master from the cloud (full wipe).\n' +
+      'Cancel = keep SAP Sales and FOC Master, only clear Orders / Virtual Stock / History.'
+    );
+    window.cloudResetEverything(alsoWipeRef);
+  }
   showToast('Full reset complete — signing out…', 'success');
   // Force the originating tab to log out too, so whoever uses next must re-authenticate
   setTimeout(() => {
@@ -20538,6 +20558,50 @@ function updateAlertsBadge() {
     } catch (err) {
       console.error('[Orders Sync] Load failed:', err);
       return 0;
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────
+  //  CLOUD RESET  —  delete shared data from Supabase
+  // ─────────────────────────────────────────────────────────────
+  // Called by the Reset Data feature so a reset clears the cloud too,
+  // not just the browser. Without this, a reset would "come back" on
+  // the next refresh because the app reloads from the database.
+  window.cloudResetOrders = async function () {
+    if (!window.SB) return;
+    try {
+      const { error } = await window.SB.from('orders').delete().neq('id', '___none___');
+      if (error) throw error;
+      console.log('[Cloud Reset] orders table cleared');
+    } catch (err) { console.error('[Cloud Reset] orders failed:', err); }
+  };
+
+  window.cloudResetVstock = async function () {
+    if (!window.SB) return;
+    try {
+      const { error } = await window.SB.from('virtual_stock').delete().neq('id', '___none___');
+      if (error) throw error;
+      _vsFingerprints = {};   // forget fingerprints so a future push re-uploads cleanly
+      console.log('[Cloud Reset] virtual_stock table cleared');
+    } catch (err) { console.error('[Cloud Reset] virtual_stock failed:', err); }
+  };
+
+  // Full reset — clears the shared tables. Does NOT touch foc_master
+  // (FOC % reference) or sales unless includeSalesAndMaster is true.
+  window.cloudResetEverything = async function (includeSalesAndMaster) {
+    if (!window.SB) return;
+    await window.cloudResetOrders();
+    await window.cloudResetVstock();
+    try {
+      await window.SB.from('history_log').delete().neq('id', -1);
+      console.log('[Cloud Reset] history_log cleared');
+    } catch (err) { console.error('[Cloud Reset] history_log failed:', err); }
+    if (includeSalesAndMaster) {
+      try {
+        await window.SB.from('sales').delete().neq('id', -1);
+        await window.SB.from('foc_master').delete().neq('id', -1);
+        console.log('[Cloud Reset] sales + foc_master cleared');
+      } catch (err) { console.error('[Cloud Reset] sales/master failed:', err); }
     }
   };
 
