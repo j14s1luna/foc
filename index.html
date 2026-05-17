@@ -3125,6 +3125,7 @@
             <div class="og-vdiv"></div>
             <button class="og-btn og-b-ghost og-b-sm" onclick="OG.openEmailModal()" id="ogBtnEmail" disabled>✉ Send E-Mail</button>
             <button class="og-btn og-b-green" onclick="OG.exportExcel()" id="ogBtnExport" disabled>⬇ Export SAP File</button>
+            <button class="og-btn og-b-blue og-b-sm" onclick="ordersSaveToCloud()" id="ogBtnSaveDb" title="Record the current orders to the shared database so all users can monitor FOC allocable">💾 Save to Database</button>
             <button class="og-btn og-b-blue og-b-sm" onclick="OG.openBatchModal()" id="ogBtnBatch">⚡ Batch Export</button>
             <button class="og-btn og-b-orange og-b-sm" onclick="OG.openBulkSapModal()" id="ogBtnBulkSap" title="Generate one SAP-template file for multiple LPOs at once, validated against Virtual Stock">📦 Bulk SAP FOC</button>
           </div>
@@ -11430,6 +11431,10 @@ function startApp() {
     } else if (typeof csLoadAllSalesIntoState === 'function') {
       csLoadAllSalesIntoState();
     }
+    // Load shared Virtual Stock + Orders so this user sees what others did.
+    if (typeof window.sharedSyncLoadAll === 'function') {
+      window.sharedSyncLoadAll();
+    }
   }
 
   if (result && result.then) {
@@ -16703,6 +16708,9 @@ function cpcPushAsTotal() {
   if (pushedCount > 0)    summaryParts.push(`${pushedCount} new item(s) · ${totalPushedQty.toLocaleString()} units`);
   if (refreshedCount > 0) summaryParts.push(`${refreshedCount} refreshed (released qty preserved)`);
   showToast(`Pushed ${summaryParts.join(' · ')}`, 'success');
+  // Sync the new/changed Virtual Stock to the shared database (smart sync —
+  // only the rows that actually changed are written).
+  if (typeof window.vsSyncToCloud === 'function') window.vsSyncToCloud();
 }
 
 // ===== Monthly scope: ONE VS entry per (item × month) — respects current filter =====
@@ -16794,6 +16802,8 @@ function cpcPushAsMonthly() {
   if (pushedCount > 0)    summaryParts.push(`${pushedCount} new line(s) · ${totalPushedQty.toLocaleString()} units`);
   if (refreshedCount > 0) summaryParts.push(`${refreshedCount} refreshed (released qty preserved)`);
   showToast(`Pushed ${summaryParts.join(' · ')}`, 'success');
+  // Sync the new/changed Virtual Stock to the shared database.
+  if (typeof window.vsSyncToCloud === 'function') window.vsSyncToCloud();
 }
 
 
@@ -20248,6 +20258,261 @@ function updateAlertsBadge() {
       return 0;
     }
   };
+})();
+</script>
+
+<!-- ============================================
+     SHARED SYNC MODULE  —  Virtual Stock + Orders
+     Mirrors state.virtualStock and state.orders to Supabase
+     so every user sees the same stock and the same orders.
+     This is what makes FOC allocable monitoring shared.
+     ============================================ -->
+<script>
+(function () {
+  'use strict';
+
+  function appUser() {
+    return (window.AUTH && window.AUTH.username) || 'unknown';
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  //  VIRTUAL STOCK  —  smart sync (only changed rows are written)
+  // ─────────────────────────────────────────────────────────────
+  // Keeps a fingerprint of the last-synced state of each batch.
+  // On sync, only batches whose fingerprint changed are upserted,
+  // and batches deleted locally are deleted remotely. If nothing
+  // changed, ZERO write requests are made — quota friendly.
+  let _vsFingerprints = {};   // { id: "qty|reserved|released|..." }
+
+  function _vsFingerprint(v) {
+    return [
+      v.virtualQty, v.reservedQty, v.releasedQty,
+      v.principal, v.materialCode, v.itemDesc,
+      v.batch, v.expiry, v.notes, v.sourceMonth
+    ].join('|');
+  }
+
+  function _vsToRow(v) {
+    return {
+      id:            String(v.id),
+      principal:     v.principal || null,
+      material_code: v.materialCode || null,
+      cpc_code:      v.cpcCode || null,
+      item_desc:     v.itemDesc || null,
+      batch:         v.batch || null,
+      expiry:        v.expiry || null,
+      virtual_qty:   Number(v.virtualQty) || 0,
+      reserved_qty:  Number(v.reservedQty) || 0,
+      released_qty:  Number(v.releasedQty) || 0,
+      source_type:   v.sourceType || null,
+      source_month:  v.sourceMonth || null,
+      notes:         v.notes || null,
+      last_updated:  new Date().toISOString(),
+      updated_by:    appUser(),
+    };
+  }
+
+  // Push local Virtual Stock changes to Supabase. Call this AFTER any
+  // push / release / edit that touches state.virtualStock.
+  window.vsSyncToCloud = async function () {
+    if (!window.SB) { console.warn('[VStock Sync] Supabase not ready'); return; }
+    const list = (window.state && window.state.virtualStock) || [];
+
+    // Find rows that are new or changed since last sync
+    const changed = [];
+    const currentIds = new Set();
+    list.forEach(v => {
+      const id = String(v.id);
+      currentIds.add(id);
+      const fp = _vsFingerprint(v);
+      if (_vsFingerprints[id] !== fp) {
+        changed.push(_vsToRow(v));
+        _vsFingerprints[id] = fp;
+      }
+    });
+
+    // Find rows deleted locally (were synced before, gone now)
+    const deletedIds = Object.keys(_vsFingerprints).filter(id => !currentIds.has(id));
+
+    try {
+      if (changed.length) {
+        // upsert in chunks of 500
+        for (let i = 0; i < changed.length; i += 500) {
+          const { error } = await window.SB
+            .from('virtual_stock')
+            .upsert(changed.slice(i, i + 500), { onConflict: 'id' });
+          if (error) throw error;
+        }
+      }
+      if (deletedIds.length) {
+        const { error } = await window.SB
+          .from('virtual_stock').delete().in('id', deletedIds);
+        if (error) throw error;
+        deletedIds.forEach(id => delete _vsFingerprints[id]);
+      }
+      if (changed.length || deletedIds.length) {
+        console.log(`[VStock Sync] ${changed.length} updated, ${deletedIds.length} removed`);
+        if (typeof showToast === 'function')
+          showToast(`Virtual Stock synced (${changed.length} change${changed.length === 1 ? '' : 's'})`, 'success');
+      } else {
+        console.log('[VStock Sync] No changes — nothing written');
+      }
+    } catch (err) {
+      console.error('[VStock Sync] Failed:', err);
+      if (typeof showToast === 'function')
+        showToast('Virtual Stock sync failed: ' + (err.message || err.code), 'error');
+    }
+  };
+
+  // Load shared Virtual Stock from Supabase into state.virtualStock.
+  window.vsLoadFromCloud = async function () {
+    if (!window.SB) { console.warn('[VStock Sync] Supabase not ready'); return 0; }
+    try {
+      const all = [];
+      let from = 0;
+      while (true) {
+        const { data, error } = await window.SB
+          .from('virtual_stock').select('*')
+          .order('material_code', { ascending: true })
+          .range(from, from + 999);
+        if (error) throw error;
+        if (!data || !data.length) break;
+        data.forEach(r => all.push(r));
+        if (data.length < 1000) break;
+        from += 1000;
+      }
+      const mapped = all.map(r => ({
+        id:           r.id,
+        principal:    r.principal || '',
+        materialCode: r.material_code || '',
+        cpcCode:      r.cpc_code || '',
+        itemDesc:     r.item_desc || '',
+        batch:        r.batch || '',
+        expiry:       r.expiry || '',
+        virtualQty:   Number(r.virtual_qty) || 0,
+        reservedQty:  Number(r.reserved_qty) || 0,
+        releasedQty:  Number(r.released_qty) || 0,
+        sourceType:   r.source_type || '',
+        sourceMonth:  r.source_month || '',
+        notes:        r.notes || '',
+        lastUpdated:  r.last_updated || '',
+      }));
+      if (window.state) window.state.virtualStock = mapped;
+      // Reset fingerprints to the just-loaded state (so first sync only writes real changes)
+      _vsFingerprints = {};
+      mapped.forEach(v => { _vsFingerprints[String(v.id)] = _vsFingerprint(v); });
+      console.log('[VStock Sync] Loaded', mapped.length, 'batches from Supabase');
+      if (typeof saveState === 'function') saveState();
+      try { if (typeof renderAll === 'function') renderAll(); } catch (e) {}
+      return mapped.length;
+    } catch (err) {
+      console.error('[VStock Sync] Load failed:', err);
+      return 0;
+    }
+  };
+
+  // ─────────────────────────────────────────────────────────────
+  //  ORDERS  —  "Save to Database" (manual, deliberate)
+  // ─────────────────────────────────────────────────────────────
+  // Records every order line in state.orders to Supabase so all
+  // users can monitor FOC allocable and avoid duplicate orders.
+  window.ordersSaveToCloud = async function () {
+    if (!window.SB) {
+      if (typeof showToast === 'function') showToast('Database not ready', 'error');
+      return;
+    }
+    const list = (window.state && window.state.orders) || [];
+    if (!list.length) {
+      if (typeof showToast === 'function') showToast('No orders to save', 'error');
+      return;
+    }
+    const batchRef = 'batch_' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '');
+    const rows = list.map(o => ({
+      id:         String(o.id),
+      order_date: o.date || null,
+      customer:   o.customer || null,
+      so_number:  o.soNumber || null,
+      item_code:  o.itemCode || null,
+      item_name:  o.itemName || null,
+      qty:        Number(o.qty) || 0,
+      status:     o.status || 'released',
+      flagged:    !!o.flagged,
+      salesman:   o.salesman || null,
+      batch_ref:  o.batchRef || batchRef,
+      saved_by:   appUser(),
+    }));
+    try {
+      for (let i = 0; i < rows.length; i += 500) {
+        const { error } = await window.SB
+          .from('orders').upsert(rows.slice(i, i + 500), { onConflict: 'id' });
+        if (error) throw error;
+      }
+      console.log('[Orders Sync] Saved', rows.length, 'order(s) to Supabase');
+      if (typeof showToast === 'function')
+        showToast(`Saved ${rows.length} order line(s) to database`, 'success');
+    } catch (err) {
+      console.error('[Orders Sync] Save failed:', err);
+      if (typeof showToast === 'function')
+        showToast('Save to database failed: ' + (err.message || err.code), 'error');
+    }
+  };
+
+  // Load shared orders from Supabase into state.orders.
+  window.ordersLoadFromCloud = async function () {
+    if (!window.SB) { console.warn('[Orders Sync] Supabase not ready'); return 0; }
+    try {
+      const all = [];
+      let from = 0;
+      while (true) {
+        const { data, error } = await window.SB
+          .from('orders').select('*')
+          .order('created_at', { ascending: true })
+          .range(from, from + 999);
+        if (error) throw error;
+        if (!data || !data.length) break;
+        data.forEach(r => all.push(r));
+        if (data.length < 1000) break;
+        from += 1000;
+      }
+      const mapped = all.map(r => ({
+        id:       r.id,
+        date:     r.order_date || '',
+        customer: r.customer || '',
+        soNumber: r.so_number || '',
+        itemCode: r.item_code || '',
+        itemName: r.item_name || '',
+        qty:      Number(r.qty) || 0,
+        status:   r.status || 'released',
+        flagged:  !!r.flagged,
+        salesman: r.salesman || '',
+        batchRef: r.batch_ref || '',
+      }));
+      if (window.state) window.state.orders = mapped;
+      console.log('[Orders Sync] Loaded', mapped.length, 'order(s) from Supabase');
+      if (typeof saveState === 'function') saveState();
+      try { if (typeof renderAll === 'function') renderAll(); } catch (e) {}
+      return mapped.length;
+    } catch (err) {
+      console.error('[Orders Sync] Load failed:', err);
+      return 0;
+    }
+  };
+
+  // Load both on startup, once Supabase is ready.
+  window.sharedSyncLoadAll = function () {
+    if (!window.SB) {
+      let tries = 0;
+      const t = setInterval(() => {
+        if (window.SB) { clearInterval(t); window.sharedSyncLoadAll(); }
+        else if (++tries > 60) clearInterval(t);
+      }, 200);
+      return;
+    }
+    window.vsLoadFromCloud();
+    window.ordersLoadFromCloud();
+  };
+
+  console.log('[Shared Sync] Module loaded — Virtual Stock + Orders sync ready');
 })();
 </script>
 
