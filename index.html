@@ -3124,10 +3124,10 @@
               </div>
             </div>
             <div class="og-vdiv"></div>
-            <button class="og-btn og-b-ghost og-b-sm" onclick="OG.openEmailModal()" id="ogBtnEmail" disabled>✉ Send E-Mail</button>
+            <button class="og-btn og-b-ghost og-b-sm" onclick="OG.openEmailModal()" id="ogBtnEmail" disabled style="display:none">✉ Send E-Mail</button>
             <button class="og-btn og-b-green" onclick="OG.exportExcel()" id="ogBtnExport" disabled>⬇ Export SAP File</button>
             <button class="og-btn og-b-blue og-b-sm" onclick="ordersSaveToCloud()" id="ogBtnSaveDb" title="Record the current orders to the shared database so all users can monitor FOC allocable">💾 Save to Database</button>
-            <button class="og-btn og-b-blue og-b-sm" onclick="OG.openBatchModal()" id="ogBtnBatch">⚡ Batch Export</button>
+            <button class="og-btn og-b-blue og-b-sm" onclick="OG.openBatchModal()" id="ogBtnBatch" style="display:none">⚡ Batch Export</button>
             <button class="og-btn og-b-orange og-b-sm" onclick="OG.openBulkSapModal()" id="ogBtnBulkSap" title="Generate one SAP-template file for multiple LPOs at once, validated against Virtual Stock">📦 Bulk SAP FOC</button>
           </div>
         </div>
@@ -3195,7 +3195,7 @@
         <!-- Sub-tabs -->
         <div class="og-tabs">
           <button class="og-tab active" onclick="OG.switchTab('order')" id="og-tab-order">📋 Order Generator</button>
-          <button class="og-tab" onclick="OG.switchTab('pending')" id="og-tab-pending">
+          <button class="og-tab" onclick="OG.switchTab('pending')" id="og-tab-pending" style="display:none">
             ⏳ Pending Lines <span class="og-tbadge og-tbadge-red" id="ogPendBadge">0</span>
           </button>
         </div>
@@ -3203,17 +3203,18 @@
         <!-- Order panel -->
         <div class="og-panel active" id="og-panel-order">
           <div class="og-sobar">
-            <label>SO No. :</label>
-            <input type="text" id="ogSoField" class="so-field" placeholder="Enter SO number..." />
-            <div class="og-vdiv" style="background:var(--border);height:22px"></div>
-            <label>Email Condition :</label>
-            <select id="ogCondField">
-              <option value="">-- Select --</option>
-              <option value="Expiry Confirmation">Expiry Confirmation</option>
-              <option value="Request Hold Item Release">Request Hold Item Release</option>
-              <option value="Both">Both (2 Emails)</option>
-            </select>
-            <div class="og-vdiv" style="background:var(--border);height:22px"></div>
+            <!-- SO No. and Email Condition hidden — kept in DOM so dependent code still works -->
+            <span style="display:none">
+              <label>SO No. :</label>
+              <input type="text" id="ogSoField" class="so-field" placeholder="Enter SO number..." />
+              <label>Email Condition :</label>
+              <select id="ogCondField">
+                <option value="">-- Select --</option>
+                <option value="Expiry Confirmation">Expiry Confirmation</option>
+                <option value="Request Hold Item Release">Request Hold Item Release</option>
+                <option value="Both">Both (2 Emails)</option>
+              </select>
+            </span>
             <label>Expiry Window:</label>
             <label style="display:flex;align-items:center;gap:5px;font-size:12.5px;cursor:pointer;color:var(--ink-soft)">
               <input type="radio" name="ogExpWindow" value="12" onchange="OG.onExpWindowChange()" checked /> 1 Year
