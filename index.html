@@ -2700,7 +2700,7 @@
           <!-- Toolbar -->
           <div style="display:flex;align-items:center;gap:10px;padding:12px 18px;background:var(--bg);border-bottom:1px solid var(--border);flex-wrap:wrap">
             <span style="font-size:11.5px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.4px">Load SAP Export:</span>
-            <input type="file" id="cpcSalesFile" class="file-hidden" accept=".xlsx,.xls,.csv" onchange="cpcLoadSalesExcel(event)" />
+            <input type="file" id="cpcSalesFile" class="file-hidden" accept=".xlsx,.xls,.csv" onchange="csImportExcel(event)" />
             <label class="btn btn-primary" for="cpcSalesFile" style="font-size:12px;padding:6px 12px;cursor:pointer">📂 Load Sales Excel</label>
             <button class="btn" onclick="cpcDownloadSalesTemplate()" style="font-size:12px;padding:6px 12px">📋 Template</button>
             <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
@@ -2708,7 +2708,7 @@
               <select id="cpcSalesMonthFilter" onchange="renderCpcSalesTable()" style="border:1px solid var(--border);border-radius:6px;padding:6px 11px;font-size:12.5px;font-family:inherit;outline:none;background:white">
                 <option value="">All Months</option>
               </select>
-              <button class="btn" onclick="cpcClearSales()" id="cpcBtnClearSales" style="font-size:12px;padding:6px 12px;background:var(--red-bg);color:var(--red-ink);border-color:#fca5a5">🗑 Clear All</button>
+              <button class="btn" onclick="csClearAllSales()" id="cpcBtnClearSales" style="font-size:12px;padding:6px 12px;background:var(--red-bg);color:var(--red-ink);border-color:#fca5a5">🗑 Clear All</button>
             </div>
           </div>
           <div id="cpcSalesTableWrap" style="max-height:calc(100vh - 460px);overflow:auto"></div>
@@ -19856,7 +19856,16 @@ function updateAlertsBadge() {
 
   function showStatus(msg, type) {
     const el = document.getElementById('csSyncStatus');
-    if (!el) return;
+    if (!el) {
+      // The status panel only exists on the Settings page. When the upload
+      // is triggered from the main CPC Sales page, fall back to a toast so
+      // the user still sees progress / success / errors.
+      if (typeof showToast === 'function') {
+        const plain = String(msg).replace(/<[^>]+>/g, '');
+        showToast(plain, type === 'error' ? 'error' : (type === 'success' ? 'success' : 'info'));
+      }
+      return;
+    }
     el.style.display = '';
     el.innerHTML = msg;
     if (type === 'success') { el.style.background = '#ECFDF5'; el.style.color = '#065F46'; el.style.borderColor = '#A7F3D0'; }
@@ -20133,7 +20142,10 @@ function updateAlertsBadge() {
 
   // ── CLEAR ALL ──
   window.csClearAllSales = async function() {
-    if (csMonths.length === 0) { showStatus('Nothing to clear', 'error'); hideStatusSoon(); return; }
+    const localCount = (window.state && window.state.cpcSales || []).length;
+    if (csMonths.length === 0 && localCount === 0) {
+      showStatus('Nothing to clear', 'error'); hideStatusSoon(); return;
+    }
     if (!confirm(`Delete ALL CPC Sales data from Supabase?\n\nThis cannot be undone.`)) return;
     showStatus(`⏳ Deleting all sales data…`);
     try {
@@ -20142,10 +20154,15 @@ function updateAlertsBadge() {
       const { error } = await window.SB.from('sales').delete().neq('id', -1);
       if (error) throw error;
       csMonths = [];
-      csRenderMonthsTable();
+      if (typeof csRenderMonthsTable === 'function') csRenderMonthsTable();
+      // Also clear the in-memory copy so the app view updates immediately.
+      if (window.state) {
+        window.state.cpcSales = [];
+        if (typeof saveState === 'function') saveState();
+        try { if (typeof renderAll === 'function') renderAll(); } catch (e) {}
+      }
       showStatus('✅ All CPC Sales data cleared from Supabase', 'success');
       hideStatusSoon();
-      if (typeof csLoadAllSalesIntoState === 'function') await csLoadAllSalesIntoState();
     } catch (err) {
       showStatus('Clear failed: ' + (err.message || err.code), 'error');
     }
