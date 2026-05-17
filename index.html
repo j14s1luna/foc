@@ -10873,6 +10873,14 @@ function renderOverview() {
   const container = document.getElementById('overviewContent');
   if (!container) return;
 
+  // Guard: the Report module may not be initialized yet when an early
+  // cloud-sync triggers renderAll(). If so, skip this render safely —
+  // a later renderAll() (after Report is ready) will draw the dashboard.
+  if (!window.Report || typeof window.Report.topFocItems !== 'function') {
+    console.warn('[Overview] Report module not ready yet — skipping render');
+    return;
+  }
+
   const hasCpc        = (state.cpcSales || []).length > 0;
   const hasVs         = (state.virtualStock || []).length > 0;
   const hasMovements  = (state.vstockMovements || []).length > 0;
